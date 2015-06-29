@@ -527,6 +527,11 @@ var Easyrtc = function() {
      * of your video objects before you use them for pixel specific operations.
      */
     this.nativeVideoHeight = 0;
+    /** This constant determines how long a message can be before being split in chunks of that size.
+     * This is because there is a limitation of the length of the message you can send on the
+     * data channel between browsers.
+     */
+    this.maxP2PMessageLength = 100;
     /** The width of the local media stream video in pixels. This field is set an indeterminate period
      * of time after easyrtc.initMediaSource succeeds.  Note: in actuality, the dimensions of a video stream
      * change dynamically in response to external factors, you should check the videoWidth and videoHeight attributes
@@ -2749,8 +2754,43 @@ var Easyrtc = function() {
     }
 
 
+    // This function is used to send large messages. It picks a new message type, then sends the data
+    // split into chunks using this message type. The receiver is informed of the beginning of the
+    // transfer by a message containing the data {startTransferOn: transferMessageType} and of the end of the
+    // transfer by a message containing the data {endOfTransfer: true}
+    var sendByChunkUidCounter = 0;
+    function sendByChunkHelper(destUser, msgData) {
+        var transferId = destUser + '-' + sendByChunkUidCounter++;
+
+        var pos, len, startMessage, message, endMessage;
+        var numberOfChunks = Math.ceil(msgData.length / self.maxP2PMessageLength);
+        startMessage = {
+            transfer: 'start',
+            transferId: transferId,
+            parts: numberOfChunks
+        };
+
+        endMessage = {
+            transfer: 'end',
+            transferId: transferId,
+        };
+
+        peerConns[destUser].dataChannelS.send(JSON.stringify(startMessage));
+
+        for (pos = 0, len = msgData.length; pos < len; pos += self.maxP2PMessageLength) {
+            message = {
+                transferId: transferId,
+                data: msgData.substr(pos, self.maxP2PMessageLength),
+                transfer: 'chunk'
+            };
+            peerConns[destUser].dataChannelS.send(JSON.stringify(message));
+        }
+
+        peerConns[destUser].dataChannelS.send(JSON.stringify(endMessage));
+    }
+
     /**
-     *Sends data to another user using previously established data channel. This method will
+     * Sends data to another user using previously established data channel. This method will
      * fail if no data channel has been established yet. Unlike the easyrtc.sendWS method,
      * you can't send a dictionary, convert dictionaries to strings using JSON.stringify first.
      * What data types you can send, and how large a data type depends on your browser.
@@ -2761,8 +2801,8 @@ var Easyrtc = function() {
      *     easyrtc.sendDataP2P(someEasyrtcid, "roomData", {room:499, bldgNum:'asd'});
      */
     this.sendDataP2P = function(destUser, msgType, msgData) {
-
         var flattenedData = JSON.stringify({msgType: msgType, msgData: msgData});
+
         if (self.debugPrinter) {
             self.debugPrinter("sending p2p message to " + destUser + " with data=" + JSON.stringify(flattenedData));
         }
@@ -2778,7 +2818,11 @@ var Easyrtc = function() {
         }
         else {
             try {
-                peerConns[destUser].dataChannelS.send(flattenedData);
+                if (flattenedData.length > self.maxP2PMessageLength) {
+                    sendByChunkHelper(destUser, flattenedData);
+                } else {
+                    peerConns[destUser].dataChannelS.send(flattenedData);
+                }
             } catch (oops) {
                 console.log("error=", oops);
                 throw oops;
@@ -3681,6 +3725,7 @@ var Easyrtc = function() {
         //
         // This function handles data channel message events.
         //
+        var pendingTransfers = {};
         function dataChannelMessageHandler(event) {
             if (self.debugPrinter) {
                 self.debugPrinter("saw dataChannel.onmessage event: " + JSON.stringify(event.data));
@@ -3698,7 +3743,40 @@ var Easyrtc = function() {
                 try {
                     var msg = JSON.parse(event.data);
                     if (msg) {
-                        self.receivePeerDistribute(otherUser, msg, null);
+                        if (msg.transfer && msg.transferId) {
+                            if (msg.transfer === 'start' && msg.parts) {
+                                if (self.debugPrinter) {
+                                    self.debugPrinter('start transfer #' + msg.transferId);
+                                }
+                                pendingTransfers[msg.transferId] = {
+                                    chunks: [],
+                                    parts: msg.parts,
+                                }
+                            } else if (msg.transfer === 'chunk' && msg.data) {
+                                if (self.debugPrinter) {
+                                    self.debugPrinter('got chunk for transfer #' + msg.transferId);
+                                }
+                                pendingTransfers[msg.transferId].chunks.push(msg.data);
+
+                            } else if (msg.transfer === 'end') {
+                                if (self.debugPrinter) {
+                                    self.debugPrinter('end of transfer #' + msg.transferId);
+                                }
+                                var pendingTransfer = pendingTransfers[msg.transferId];
+
+                                if (!pendingTransfer.chunks.length === pendingTransfer.chunks) {
+                                    console.log('Developper error, a chunk is missing');
+                                } else {
+                                    var chunkedMsg = JSON.parse(pendingTransfer.chunks.join(''));
+                                    self.receivePeerDistribute(otherUser, chunkedMsg, null);
+                                    delete pendingTransfers[msg.transferId];
+                                }
+                            } else {
+                                console.log('Developper error, got an unknown transfer message' + msg.transfer);
+                            }
+                        } else {
+                            self.receivePeerDistribute(otherUser, msg, null);
+                        }
                     }
                 }
                 catch (err) {
